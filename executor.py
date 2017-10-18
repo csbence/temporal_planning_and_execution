@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import math
 from adjust_til import adjust_til
+import plan_tools
 from os import path, makedirs
 from subprocess import run, TimeoutExpired
 import os
@@ -33,29 +34,31 @@ class Configuration:
 
     def __init__(self, domain, problem, memory_limit, time_limit, adjustment):
         self.domain = domain
-        self.problem = problem
+        self.problem = problem # Might be changed to the adjusted problem
         self.memory_limit = memory_limit
         self.time_limit = time_limit
         self.adjustment = adjustment
+        self.domain_name = path.basename(domain) 
+        self.problem_name = path.basename(problem) 
 
 
 class Result:
 
-    def __init__(self, configuration, success, error):
+    def __init__(self, configuration, success, error, path=None):
         self.configuration = configuration
         self.success = success
         self.error = error
+        self.path = path
+        self.gat = None
 
     def __str__(self):
         return self.__repr__()
 
     def __repr__(self):
-        return '[success: {} error: {}]'.format(self.success, self.error)
+        return '[success: {} gat: {} error: {}]'.format(self.success, self.gat, self.error)
 
 
-def create_problem_dir(domain, problem, adjustment):
-    domain_name = path.basename(domain) 
-    problem_name = path.basename(problem) 
+def create_problem_dir(domain_name, problem_name, adjustment):
     problem_dir = '/'.join([RESULT_DIR, domain_name, problem_name, str(adjustment)])
     makedirs(problem_dir, exist_ok=True)
     return problem_dir
@@ -71,24 +74,22 @@ def set_memory_limit(memory_limit_bytes):
     resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
 
 
-def plan_smart(configuration, problem_dir):
+def plan(configuration, problem_dir, planner):
     command = ' '.join([
-        SMART_PLANNER, configuration.domain, configuration.problem,
-        '>', problem_dir + '/planner.out'
+        planner, configuration.domain, configuration.problem,
+        '>', problem_dir + '/planner.out', '2>', problem_dir + '/planner.error'
         ])
     completed_process = run([command], shell=True, timeout=configuration.time_limit, preexec_fn=lambda: set_memory_limit(configuration.memory_limit))
     if completed_process.returncode != 0:
         raise PlanningError(completed_process.returncode) 
+
+
+def plan_smart(configuration, problem_dir):
+    plan(configuration, problem_dir, SMART_PLANNER)
 
 
 def plan_adjusted(configuration, problem_dir):
-    command = ' '.join([
-        PLANNER, configuration.domain, configuration.problem,
-        '>', problem_dir + '/planner.out'
-        ])
-    completed_process = run([command], shell=True, timeout=configuration.time_limit, preexec_fn=lambda: set_memory_limit(configuration.memory_limit))
-    if completed_process.returncode != 0:
-        raise PlanningError(completed_process.returncode) 
+    plan(configuration, problem_dir, PLANNER)
 
 
 def extract_plan(problem_dir):
@@ -102,12 +103,12 @@ def extract_and_adjust_plan(problem_dir, adjustment):
 
 
 def validate_plan(configuration, problem_dir):
-    command = VAL + ' -t 0.001 {0} {1} {2}/adjusted_plan > {2}/val.log'.format(configuration.domain, configuration.problem, problem_dir)
+    command = VAL + ' -t 0.001 {0} {1} {2}/plan > {2}/val.log'.format(configuration.domain, configuration.problem, problem_dir)
     return run([command], shell=True, timeout=configuration.time_limit).returncode == 0
 
 
 def execute_configuration(configuration):
-    problem_dir = create_problem_dir(configuration.domain, configuration.problem, configuration.adjustment)
+    problem_dir = create_problem_dir(configuration.domain_name, configuration.problem_name, configuration.adjustment)
 
     try:
        if isinstance(configuration.adjustment, int):
@@ -118,10 +119,9 @@ def execute_configuration(configuration):
        else:
            plan_smart(configuration, problem_dir)
            extract_plan(problem_dir)
-           pass
 
        success = validate_plan(configuration, problem_dir)
-       return Result(configuration=configuration, success=success, error=None)
+       return Result(configuration=configuration, success=success, error=None, path=problem_dir)
     except TimeoutExpired:
        return Result(configuration=configuration, success=False, error='TimeoutExpired')
     except PlanningError:
@@ -149,15 +149,28 @@ def execute_configurations(configurations, threads=1):
 
 def process_results(results):
     for result in results:
-        print(result) 
+        configuration = result.configuration
+        problem_dir = create_problem_dir(configuration.domain_name, configuration.problem_name, configuration.adjustment)
+
+        if (result.success):
+            plan = plan_tools.plan_from_file(problem_dir + '/plan')
+            result.gat = plan_tools.gat_from_plan(plan) 
+        else:
+            result.gat = None
+
+        print('domain: {domain} problem: {problem} adjustment: {adjustment} result: {result}'.format(
+            domain=configuration.domain_name,
+            problem=configuration.problem_name,
+            adjustment=configuration.adjustment,
+            result=result))
+
     # Plot data
-    pass
 
 
 def generate_configurations():
     # We probably want to replace the hardcoded parts
     domain = '/home/aifs2/bence/development/projects/temporal_planning_and_execution/resources/DOMAINS/trucks/TimeConstraints/Time-TIL/domain.pddl'
-    problem = '/home/aifs2/bence/development/projects/temporal_planning_and_execution/resources/DOMAINS/trucks/TimeConstraints/Time-TIL/p01.pddl'
+    problem = '/home/aifs2/bence/development/projects/temporal_planning_and_execution/resources/DOMAINS/trucks/TimeConstraints/Time-TIL/p07.pddl'
     memory_limit = 4 * 1024 ** 3
     time_limit = 1800
     adjustments = ['smart', 1, 10, 100, 1000]
@@ -167,7 +180,7 @@ def generate_configurations():
 
 def main():
     configurations = generate_configurations()
-    results = execute_configurations(configurations)
+    results = execute_configurations(configurations, threads=5)
     process_results(results)
 
 
